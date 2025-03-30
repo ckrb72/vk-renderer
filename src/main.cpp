@@ -3,11 +3,21 @@
 #include <GLFW/glfw3.h>
 #include <VkBootstrap.h>
 #include <vector>
+#include "vma.h"
 
 const int WIN_WIDTH = 1920;
 const int WIN_HEIGHT = 1080;
 
 constexpr uint32_t FRAME_OVERLAP = 2;
+
+struct AllocatedImage
+{
+    VkImage image;
+    VkImageView image_view;
+    VmaAllocation allocation;
+    VkExtent3D extent;
+    VkFormat format;
+};
 
 struct VulkanContext
 {
@@ -41,6 +51,11 @@ struct VulkanContext
 
     FrameData frames[FRAME_OVERLAP];
 
+    VmaAllocator allocator;
+
+    AllocatedImage draw_image;
+    VkExtent2D draw_extent;
+
 };
 
 
@@ -53,7 +68,9 @@ void transition_image(VkCommandBuffer cmd, VkImage image, VkImageLayout current_
 VkSemaphoreSubmitInfo semaphore_submit_info(VkPipelineStageFlags2 stage_mask, VkSemaphore semaphore);
 VkCommandBufferSubmitInfo command_buffer_submit_info(VkCommandBuffer command_buffer);
 VkSubmitInfo2 submit_info(VkCommandBufferSubmitInfo* cmd, VkSemaphoreSubmitInfo* signal_semaphore_info, VkSemaphoreSubmitInfo* wait_semaphore_info);
-
+VkImageCreateInfo image_create_info(VkFormat format, VkImageUsageFlags usage_flags, VkExtent3D extent);
+VkImageViewCreateInfo imageview_create_info(VkFormat format, VkImage image, VkImageAspectFlags aspect_flags);
+void copy_image_to_image(VkCommandBuffer cmd, VkImage source, VkImage destination, VkExtent2D src_size, VkExtent2D dst_size);
 
 #define VK_CHECK(func) func
 
@@ -87,6 +104,9 @@ int main()
         vkAcquireNextImageKHR(context.device, context.swapchain.swapchain, UINT64_MAX, context.frames[current_frame % FRAME_OVERLAP].swapchain_semaphore, nullptr, &swapchain_index);
         vkResetCommandBuffer(context.frames[current_frame % FRAME_OVERLAP].command_buffer, 0);
 
+        context.draw_extent.width = context.draw_image.extent.width;
+        context.draw_extent.height = context.draw_image.extent.height;
+
         // Record Command Buffer
         VkCommandBufferBeginInfo cmd_buffer_info = {};
         cmd_buffer_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -96,7 +116,7 @@ int main()
 
         vkBeginCommandBuffer(context.frames[current_frame % FRAME_OVERLAP].command_buffer, &cmd_buffer_info);
 
-        transition_image(context.frames[current_frame % FRAME_OVERLAP].command_buffer, context.swapchain.images[swapchain_index], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+        transition_image(context.frames[current_frame % FRAME_OVERLAP].command_buffer, context.draw_image.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
 
         VkClearColorValue clear_value;
         float flash = std::abs(std::sin(current_frame / 120.0f));
@@ -109,9 +129,13 @@ int main()
         clear_range.baseArrayLayer = 0;
         clear_range.layerCount = VK_REMAINING_ARRAY_LAYERS;
 
-        vkCmdClearColorImage(context.frames[current_frame % FRAME_OVERLAP].command_buffer, context.swapchain.images[swapchain_index], VK_IMAGE_LAYOUT_GENERAL, &clear_value, 1, &clear_range);
+        vkCmdClearColorImage(context.frames[current_frame % FRAME_OVERLAP].command_buffer, context.draw_image.image, VK_IMAGE_LAYOUT_GENERAL, &clear_value, 1, &clear_range);
 
-        transition_image(context.frames[current_frame % FRAME_OVERLAP].command_buffer, context.swapchain.images[swapchain_index], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+        transition_image(context.frames[current_frame % FRAME_OVERLAP].command_buffer, context.draw_image.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        transition_image(context.frames[current_frame % FRAME_OVERLAP].command_buffer, context.swapchain.images[swapchain_index], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        copy_image_to_image(context.frames[current_frame % FRAME_OVERLAP].command_buffer, context.draw_image.image, context.swapchain.images[swapchain_index], context.draw_extent, context.swapchain.extent);
+        transition_image(context.frames[current_frame % FRAME_OVERLAP].command_buffer, context.swapchain.images[swapchain_index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+
         vkEndCommandBuffer(context.frames[current_frame % FRAME_OVERLAP].command_buffer);
 
         VkCommandBufferSubmitInfo cmd_info = command_buffer_submit_info(context.frames[current_frame % FRAME_OVERLAP].command_buffer);
@@ -150,6 +174,11 @@ int main()
         vkDestroySemaphore(context.device, context.frames[i].render_semaphore, NULL);
         vkDestroySemaphore(context.device, context.frames[i].swapchain_semaphore, NULL);
     }
+
+    vkDestroyImageView(context.device, context.draw_image.image_view, NULL);
+    vmaDestroyImage(context.allocator, context.draw_image.image, context.draw_image.allocation);
+
+    vmaDestroyAllocator(context.allocator);
 
     destroy_swapchain(context);
     vkDestroySurfaceKHR(context.instance, context.surface, NULL);
@@ -204,6 +233,13 @@ void init_vulkan(VulkanContext& context, GLFWwindow* window)
 
     context.graphics_queue = device.get_queue(vkb::QueueType::graphics).value();
     context.graphics_queue_family = device.get_queue_index(vkb::QueueType::graphics).value();
+
+    VmaAllocatorCreateInfo allocator_info = {};
+    allocator_info.physicalDevice = context.gpu;
+    allocator_info.device = context.device;
+    allocator_info.instance = context.instance;
+    allocator_info.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
+    vmaCreateAllocator(&allocator_info, &context.allocator);
 }
 
 void create_swapchain(uint32_t width, uint32_t height, VulkanContext& context)
@@ -225,6 +261,68 @@ void create_swapchain(uint32_t width, uint32_t height, VulkanContext& context)
     context.swapchain.swapchain = vkb_swapchain.swapchain;
     context.swapchain.images = vkb_swapchain.get_images().value();
     context.swapchain.image_views = vkb_swapchain.get_image_views().value();
+
+    VkExtent3D draw_image_extent = {};
+    draw_image_extent.width = context.swapchain.extent.width;
+    draw_image_extent.height = context.swapchain.extent.height;
+    draw_image_extent.depth = 1;
+
+    context.draw_image.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    context.draw_image.extent = draw_image_extent;
+
+    VkImageUsageFlags draw_image_usages = {};
+    draw_image_usages |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    draw_image_usages |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    draw_image_usages |= VK_IMAGE_USAGE_STORAGE_BIT;
+    draw_image_usages |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+
+    VkImageCreateInfo rimg_info = image_create_info(context.draw_image.format, draw_image_usages, draw_image_extent);
+    VmaAllocationCreateInfo rimg_allocinfo = {};
+    rimg_allocinfo.usage = VMA_MEMORY_USAGE_GPU_ONLY;
+    rimg_allocinfo.requiredFlags = VkMemoryPropertyFlags(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+    vmaCreateImage(context.allocator, &rimg_info, &rimg_allocinfo, &context.draw_image.image, &context.draw_image.allocation, nullptr);
+
+    VkImageViewCreateInfo rview_info = imageview_create_info(context.draw_image.format, context.draw_image.image, VK_IMAGE_ASPECT_COLOR_BIT);
+
+    vkCreateImageView(context.device, &rview_info, nullptr, &context.draw_image.image_view);
+
+}
+
+void copy_image_to_image(VkCommandBuffer cmd, VkImage source, VkImage destination, VkExtent2D src_size, VkExtent2D dst_size)
+{
+    VkImageBlit2 blit_region = {};
+    blit_region.sType = VK_STRUCTURE_TYPE_IMAGE_BLIT_2;
+
+    blit_region.srcOffsets[1].x = src_size.width;
+    blit_region.srcOffsets[1].y = src_size.height;
+    blit_region.srcOffsets[1].z = 1;
+
+    blit_region.dstOffsets[1].x = dst_size.width;
+    blit_region.dstOffsets[1].y = dst_size.height;
+    blit_region.dstOffsets[1].z = 1;
+
+    blit_region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    blit_region.srcSubresource.baseArrayLayer = 0;
+    blit_region.srcSubresource.layerCount = 1;
+    blit_region.srcSubresource.mipLevel = 0;
+
+    blit_region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    blit_region.dstSubresource.baseArrayLayer = 0;
+    blit_region.dstSubresource.layerCount = 1;
+    blit_region.dstSubresource.mipLevel = 0;
+
+    VkBlitImageInfo2 blit_info = {};
+    blit_info.sType = VK_STRUCTURE_TYPE_BLIT_IMAGE_INFO_2;
+    blit_info.dstImage = destination;
+    blit_info.dstImageLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    blit_info.srcImage = source;
+    blit_info.srcImageLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    blit_info.filter = VK_FILTER_LINEAR;
+    blit_info.regionCount = 1;
+    blit_info.pRegions = &blit_region;
+
+    vkCmdBlitImage2(cmd, &blit_info);
 }
 
 void init_commands(VulkanContext& context)
@@ -335,6 +433,42 @@ VkSubmitInfo2 submit_info(VkCommandBufferSubmitInfo* cmd, VkSemaphoreSubmitInfo*
 
     info.commandBufferInfoCount = 1;
     info.pCommandBufferInfos = cmd;
+
+    return info;
+}
+
+VkImageCreateInfo image_create_info(VkFormat format, VkImageUsageFlags usage_flags, VkExtent3D extent)
+{
+    VkImageCreateInfo info = {};
+    info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    info.imageType = VK_IMAGE_TYPE_2D;
+    info.format = format;
+    info.extent = extent;
+
+    info.mipLevels = 1;
+    info.arrayLayers = 1;
+
+    info.samples = VK_SAMPLE_COUNT_1_BIT;
+
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = usage_flags;
+
+    return info;
+}
+
+VkImageViewCreateInfo imageview_create_info(VkFormat format, VkImage image, VkImageAspectFlags aspect_flags)
+{
+    VkImageViewCreateInfo info = {};
+    info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+
+    info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    info.image = image;
+    info.format = format;
+    info.subresourceRange.baseMipLevel = 0;
+    info.subresourceRange.levelCount = 1;
+    info.subresourceRange.baseArrayLayer = 0;
+    info.subresourceRange.layerCount = 1;
+    info.subresourceRange.aspectMask = aspect_flags;
 
     return info;
 }
