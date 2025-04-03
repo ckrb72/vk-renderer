@@ -18,5 +18,7 @@ void main()
             color.x = float(texelCoord.x) / (size.x);
             color.y = float(texelCoord.y) / (size.y);
         }
+
+        imageStore(image, texelCoord, color);
     }
 }

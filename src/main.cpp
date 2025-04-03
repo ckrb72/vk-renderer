@@ -1,8 +1,10 @@
 #include <iostream>
+#include <fstream>
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 #include <VkBootstrap.h>
 #include <vector>
+#include <span>
 #include "vma.h"
 
 const int WIN_WIDTH = 1920;
@@ -17,6 +19,31 @@ struct AllocatedImage
     VmaAllocation allocation;
     VkExtent3D extent;
     VkFormat format;
+};
+
+struct DescriptorLayoutBuilder
+{
+    std::vector<VkDescriptorSetLayoutBinding> bindings;
+    void add_binding(uint32_t binding, VkDescriptorType type);
+    void clear();
+    VkDescriptorSetLayout build(VkDevice device, VkShaderStageFlags shader_stages, void* pNext = nullptr, VkDescriptorSetLayoutCreateFlags = 0);
+};
+
+struct DescriptorAllocator
+{
+    struct PoolSizeRatio
+    {
+        VkDescriptorType type;
+        float ratio;
+    };
+
+    VkDescriptorPool pool;
+
+    void init_pool(VkDevice device, uint32_t max_sets, std::span<PoolSizeRatio> pool_ratios);
+    void clear_descriptors(VkDevice device);
+    void destroy_pool(VkDevice device);
+
+    VkDescriptorSet allocate(VkDevice device, VkDescriptorSetLayout layout);
 };
 
 struct VulkanContext
@@ -56,6 +83,13 @@ struct VulkanContext
     AllocatedImage draw_image;
     VkExtent2D draw_extent;
 
+    DescriptorAllocator descriptor_allocator;
+    VkDescriptorSet draw_image_descriptors;
+    VkDescriptorSetLayout draw_image_descriptor_layout;
+
+    VkPipeline gradient_pipeline;
+    VkPipelineLayout gradient_pipeline_layout;
+
 };
 
 
@@ -71,6 +105,9 @@ VkSubmitInfo2 submit_info(VkCommandBufferSubmitInfo* cmd, VkSemaphoreSubmitInfo*
 VkImageCreateInfo image_create_info(VkFormat format, VkImageUsageFlags usage_flags, VkExtent3D extent);
 VkImageViewCreateInfo imageview_create_info(VkFormat format, VkImage image, VkImageAspectFlags aspect_flags);
 void copy_image_to_image(VkCommandBuffer cmd, VkImage source, VkImage destination, VkExtent2D src_size, VkExtent2D dst_size);
+void init_descriptors(VulkanContext& context);
+void init_pipelines(VulkanContext& context);
+void init_background_pipelines(VulkanContext& context);
 
 #define VK_CHECK(func) func
 
@@ -91,6 +128,8 @@ int main()
     create_swapchain(WIN_WIDTH, WIN_HEIGHT, context);
     init_commands(context);
     init_sync_structures(context);
+    init_descriptors(context);
+    init_pipelines(context);
 
     uint32_t current_frame = 0;
     while(!glfwWindowShouldClose(window))
@@ -118,7 +157,7 @@ int main()
 
         transition_image(context.frames[current_frame % FRAME_OVERLAP].command_buffer, context.draw_image.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
 
-        VkClearColorValue clear_value;
+        /*VkClearColorValue clear_value;
         float flash = std::abs(std::sin(current_frame / 120.0f));
         clear_value = { {0.0f, 0.0f, flash, 1.0f } };
 
@@ -129,7 +168,11 @@ int main()
         clear_range.baseArrayLayer = 0;
         clear_range.layerCount = VK_REMAINING_ARRAY_LAYERS;
 
-        vkCmdClearColorImage(context.frames[current_frame % FRAME_OVERLAP].command_buffer, context.draw_image.image, VK_IMAGE_LAYOUT_GENERAL, &clear_value, 1, &clear_range);
+        vkCmdClearColorImage(context.frames[current_frame % FRAME_OVERLAP].command_buffer, context.draw_image.image, VK_IMAGE_LAYOUT_GENERAL, &clear_value, 1, &clear_range);*/
+
+        vkCmdBindPipeline(context.frames[current_frame % FRAME_OVERLAP].command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, context.gradient_pipeline);
+        vkCmdBindDescriptorSets(context.frames[current_frame % FRAME_OVERLAP].command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, context.gradient_pipeline_layout, 0, 1, &context.draw_image_descriptors, 0, nullptr);
+        vkCmdDispatch(context.frames[current_frame % FRAME_OVERLAP].command_buffer, std::ceil(context.draw_extent.width / 16.0), std::ceil(context.draw_extent.height / 16.0), 1);
 
         transition_image(context.frames[current_frame % FRAME_OVERLAP].command_buffer, context.draw_image.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         transition_image(context.frames[current_frame % FRAME_OVERLAP].command_buffer, context.swapchain.images[swapchain_index], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
@@ -165,6 +208,11 @@ int main()
 
     vkDeviceWaitIdle(context.device);
 
+    vkDestroyPipelineLayout(context.device, context.gradient_pipeline_layout, nullptr);
+    vkDestroyPipeline(context.device, context.gradient_pipeline, nullptr);
+
+    context.descriptor_allocator.destroy_pool(context.device);
+    vkDestroyDescriptorSetLayout(context.device, context.draw_image_descriptor_layout, nullptr);
 
     for(int i = 0; i < FRAME_OVERLAP; i++)
     {
@@ -481,4 +529,211 @@ void destroy_swapchain(VulkanContext& context)
     {
         vkDestroyImageView(context.device, view, NULL);
     }
+}
+
+void DescriptorLayoutBuilder::add_binding(uint32_t binding, VkDescriptorType type)
+{
+    VkDescriptorSetLayoutBinding new_bind = {};
+    new_bind.binding = binding;
+    new_bind.descriptorCount = 1;
+    new_bind.descriptorType = type;
+
+    bindings.push_back(new_bind);
+}
+
+void DescriptorLayoutBuilder::clear()
+{
+    bindings.clear();
+}
+
+VkDescriptorSetLayout DescriptorLayoutBuilder::build(VkDevice device, VkShaderStageFlags shader_stages, void* pNext, VkDescriptorSetLayoutCreateFlags flags)
+{
+    for(VkDescriptorSetLayoutBinding& b : bindings)
+    {
+        b.stageFlags |= shader_stages;
+    }
+
+    VkDescriptorSetLayoutCreateInfo info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    info.pNext = pNext;
+    info.pBindings = bindings.data();
+    info.bindingCount = (uint32_t)bindings.size();
+    info.flags = flags;
+
+    VkDescriptorSetLayout set;
+    if(vkCreateDescriptorSetLayout(device, &info, nullptr, &set) != VK_SUCCESS)
+    {
+        std::cerr << "Failed to create descriptor layout" << std::endl;
+        exit(-1);
+    }
+
+    return set;
+}
+
+void DescriptorAllocator::init_pool(VkDevice device, uint32_t max_sets, std::span<PoolSizeRatio> pool_ratios)
+{
+    std::vector<VkDescriptorPoolSize> pool_sizes;
+    for(PoolSizeRatio ratio : pool_ratios)
+    {
+        pool_sizes.push_back(VkDescriptorPoolSize{
+            .type = ratio.type,
+            .descriptorCount = (uint32_t)(ratio.ratio * max_sets)
+        });
+    }
+
+    VkDescriptorPoolCreateInfo pool_info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pool_info.flags = 0;
+    pool_info.maxSets = max_sets;
+    pool_info.poolSizeCount = (uint32_t)pool_sizes.size();
+    pool_info.pPoolSizes = pool_sizes.data();
+
+    vkCreateDescriptorPool(device, &pool_info, nullptr, &pool);
+}
+
+void DescriptorAllocator::clear_descriptors(VkDevice device)
+{
+    vkResetDescriptorPool(device, pool, 0);
+}
+
+void DescriptorAllocator::destroy_pool(VkDevice device)
+{
+    vkDestroyDescriptorPool(device, pool, nullptr);
+}
+
+VkDescriptorSet DescriptorAllocator::allocate(VkDevice device, VkDescriptorSetLayout layout)
+{
+    VkDescriptorSetAllocateInfo alloc_info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    alloc_info.pNext = nullptr;
+    alloc_info.descriptorPool = pool;
+    alloc_info.descriptorSetCount = 1;
+    alloc_info.pSetLayouts = &layout;
+
+    VkDescriptorSet set;
+    if(vkAllocateDescriptorSets(device, &alloc_info, &set) != VK_SUCCESS)
+    {
+        std::cerr << "Failed to create descriptor set" << std::endl;
+        exit(-1);
+    }
+
+    return set;
+}
+
+void init_descriptors(VulkanContext& context)
+{
+    std::vector<DescriptorAllocator::PoolSizeRatio> sizes = 
+    {
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1}
+    };
+
+    context.descriptor_allocator.init_pool(context.device, 10, sizes);
+
+    {
+        DescriptorLayoutBuilder builder;
+        builder.add_binding(0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+        context.draw_image_descriptor_layout = builder.build(context.device, VK_SHADER_STAGE_COMPUTE_BIT);
+    }
+
+    context.draw_image_descriptors = context.descriptor_allocator.allocate(context.device, context.draw_image_descriptor_layout);
+
+    VkDescriptorImageInfo img_info = {};
+    img_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    img_info.imageView = context.draw_image.image_view;
+    
+    VkWriteDescriptorSet draw_image_write = {};
+    draw_image_write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    draw_image_write.pNext = nullptr;
+    draw_image_write.dstBinding = 0;
+    draw_image_write.dstSet = context.draw_image_descriptors;
+    draw_image_write.descriptorCount = 1;
+    draw_image_write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    draw_image_write.pImageInfo = &img_info;
+
+    vkUpdateDescriptorSets(context.device, 1, &draw_image_write, 0, nullptr);
+}
+
+bool load_shader_module(const char* path, VkDevice device, VkShaderModule* out_module)
+{
+    std::ifstream file(path, std::ios::ate | std::ios::binary);
+    if(!file.is_open())
+    {
+        std::cerr << "Failed to open file" << std::endl;
+        exit(-1);
+    }
+
+    size_t file_size = (size_t)file.tellg();
+
+    std::vector<uint32_t> buffer(file_size / sizeof(uint32_t));
+
+    file.seekg(0);
+
+    file.read((char*)buffer.data(), file_size);
+
+    file.close();
+
+    VkShaderModuleCreateInfo create_info = {};
+    create_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    create_info.pNext = nullptr;
+
+    create_info.codeSize = buffer.size() * sizeof(uint32_t);
+    create_info.pCode = buffer.data();
+
+    VkShaderModule shader_module;
+    if(vkCreateShaderModule(device, &create_info, nullptr, &shader_module) != VK_SUCCESS)
+    {
+        std::cerr << "Failed to create shader module" << std::endl;
+        exit(-1);
+    }
+
+    *out_module = shader_module;
+
+    return true;
+}
+
+void init_pipelines(VulkanContext& context)
+{
+    init_background_pipelines(context);
+    std::cout << "Compute pipeline created" << std::endl;
+}
+
+
+void init_background_pipelines(VulkanContext& context)
+{
+    VkPipelineLayoutCreateInfo compute_layout = {};
+    compute_layout.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    compute_layout.pNext= nullptr;
+    compute_layout.pSetLayouts = &context.draw_image_descriptor_layout;
+    compute_layout.setLayoutCount = 1;
+
+    if(vkCreatePipelineLayout(context.device, &compute_layout, nullptr, &context.gradient_pipeline_layout) != VK_SUCCESS)
+    {
+        std::cerr << "Failed to create pipeline layout" << std::endl;
+        exit(-1);
+    }
+
+    VkShaderModule compute_draw_shader;
+    if(!load_shader_module("../gradient.spv", context.device, &compute_draw_shader))
+    {
+        std::cerr << "Failed to create shader module" << std::endl;
+        exit(-1);
+    }
+
+    VkPipelineShaderStageCreateInfo stage_info = {};
+    stage_info.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stage_info.pNext = nullptr;
+    stage_info.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    stage_info.module = compute_draw_shader;
+    stage_info.pName = "main";
+
+    VkComputePipelineCreateInfo compute_pipeline_create_info = {};
+    compute_pipeline_create_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    compute_pipeline_create_info.pNext = nullptr;
+    compute_pipeline_create_info.layout = context.gradient_pipeline_layout;
+    compute_pipeline_create_info.stage = stage_info;
+    
+    if(vkCreateComputePipelines(context.device, VK_NULL_HANDLE, 1, &compute_pipeline_create_info, nullptr, &context.gradient_pipeline) != VK_SUCCESS)
+    {
+        std::cerr << "Failed to create pipeline" << std::endl;
+        exit(-1);
+    }
+
+    vkDestroyShaderModule(context.device, compute_draw_shader, nullptr);
 }
