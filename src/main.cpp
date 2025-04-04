@@ -7,6 +7,10 @@
 #include <span>
 #include "vma.h"
 
+#include "imgui/imgui.h"
+#include "imgui/imgui_impl_glfw.h"
+#include "imgui/imgui_impl_vulkan.h"
+
 const int WIN_WIDTH = 1920;
 const int WIN_HEIGHT = 1080;
 
@@ -90,6 +94,13 @@ struct VulkanContext
     VkPipeline gradient_pipeline;
     VkPipelineLayout gradient_pipeline_layout;
 
+    struct ImGuiHandle
+    {
+        VkDescriptorPool descriptor_pool;
+    };
+
+    ImGuiHandle imgui;
+
 };
 
 
@@ -108,6 +119,9 @@ void copy_image_to_image(VkCommandBuffer cmd, VkImage source, VkImage destinatio
 void init_descriptors(VulkanContext& context);
 void init_pipelines(VulkanContext& context);
 void init_background_pipelines(VulkanContext& context);
+void init_imgui(VulkanContext& context, GLFWwindow* window);
+void destroy_imgui(VulkanContext& context);
+void draw_imgui(VulkanContext& context, VkCommandBuffer cmd, VkImageView target_image_view);
 
 #define VK_CHECK(func) func
 
@@ -130,11 +144,18 @@ int main()
     init_sync_structures(context);
     init_descriptors(context);
     init_pipelines(context);
+    init_imgui(context, window);
 
     uint32_t current_frame = 0;
     while(!glfwWindowShouldClose(window))
     {
         glfwPollEvents();
+
+        ImGui_ImplVulkan_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+        ImGui::ShowDemoWindow();
+        ImGui::Render();    // Doesn't actually draw imgui, just calculates vertices
 
         vkWaitForFences(context.device, 1, &context.frames[current_frame % FRAME_OVERLAP].render_fence, true, UINT64_MAX);
         vkResetFences(context.device, 1, &context.frames[current_frame % FRAME_OVERLAP].render_fence);
@@ -177,6 +198,9 @@ int main()
         transition_image(context.frames[current_frame % FRAME_OVERLAP].command_buffer, context.draw_image.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         transition_image(context.frames[current_frame % FRAME_OVERLAP].command_buffer, context.swapchain.images[swapchain_index], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         copy_image_to_image(context.frames[current_frame % FRAME_OVERLAP].command_buffer, context.draw_image.image, context.swapchain.images[swapchain_index], context.draw_extent, context.swapchain.extent);
+        
+        draw_imgui(context, context.frames[current_frame % FRAME_OVERLAP].command_buffer, context.swapchain.image_views[swapchain_index]);
+
         transition_image(context.frames[current_frame % FRAME_OVERLAP].command_buffer, context.swapchain.images[swapchain_index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
 
         vkEndCommandBuffer(context.frames[current_frame % FRAME_OVERLAP].command_buffer);
@@ -207,6 +231,8 @@ int main()
     }
 
     vkDeviceWaitIdle(context.device);
+
+    destroy_imgui(context);
 
     vkDestroyPipelineLayout(context.device, context.gradient_pipeline_layout, nullptr);
     vkDestroyPipeline(context.device, context.gradient_pipeline, nullptr);
@@ -736,4 +762,108 @@ void init_background_pipelines(VulkanContext& context)
     }
 
     vkDestroyShaderModule(context.device, compute_draw_shader, nullptr);
+}
+
+void init_imgui(VulkanContext& context, GLFWwindow* window)
+{
+    VkDescriptorPoolSize pool_sizes[] = {
+        {VK_DESCRIPTOR_TYPE_SAMPLER, 1000},
+		{ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1000 },
+		{ VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1000 },
+		{ VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1000 },
+		{ VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1000 },
+		{ VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 1000 },
+		{ VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1000 },
+		{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1000 },
+		{ VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1000 },
+		{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1000 },
+		{ VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1000 }
+    };
+
+    VkDescriptorPoolCreateInfo pool_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
+        .maxSets = 1000,
+        .poolSizeCount = (uint32_t)std::size(pool_sizes),
+        .pPoolSizes = pool_sizes
+    };
+
+    if(vkCreateDescriptorPool(context.device, &pool_info, nullptr, &context.imgui.descriptor_pool) != VK_SUCCESS)
+    {
+        std::cerr << "Failed to create imgui descriptor pool" << std::endl;
+        exit(-1);
+    }
+
+
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+
+    ImGui::StyleColorsDark();
+
+    ImGui_ImplGlfw_InitForVulkan(window, true);
+    ImGui_ImplVulkan_InitInfo init_info = {};
+    init_info.Instance = context.instance;
+    init_info.PhysicalDevice = context.gpu;
+    init_info.Device = context.device;
+    init_info.QueueFamily = context.graphics_queue_family;
+    init_info.Queue = context.graphics_queue;
+    init_info.PipelineCache = VK_NULL_HANDLE;
+    init_info.Allocator = nullptr;
+    init_info.DescriptorPool = context.imgui.descriptor_pool;
+    init_info.MinImageCount = 3;
+    init_info.ImageCount = 3;
+    init_info.UseDynamicRendering = true;
+
+    init_info.PipelineRenderingCreateInfo = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    init_info.PipelineRenderingCreateInfo.colorAttachmentCount = 1;
+    init_info.PipelineRenderingCreateInfo.pColorAttachmentFormats = &context.swapchain.format;
+
+    init_info.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+
+    ImGui_ImplVulkan_Init(&init_info);
+    ImGui_ImplVulkan_CreateFontsTexture();
+
+}
+
+void destroy_imgui(VulkanContext& context)
+{
+    ImGui_ImplVulkan_Shutdown();
+    vkDestroyDescriptorPool(context.device, context.imgui.descriptor_pool, nullptr);
+}
+
+VkRenderingAttachmentInfo attachment_info(VkImageView view, VkClearValue* clear, VkImageLayout layout)
+{
+    VkRenderingAttachmentInfo color_attachment = {
+        .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+        .pNext = nullptr,
+        .imageView = view,
+        .imageLayout = layout,
+        .loadOp = clear ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
+        .storeOp = VK_ATTACHMENT_STORE_OP_STORE
+    };
+
+    if(clear)
+        color_attachment.clearValue = *clear;
+
+    
+    return color_attachment;
+}
+
+void draw_imgui(VulkanContext& context, VkCommandBuffer cmd, VkImageView target_image_view)
+{
+    VkRenderingAttachmentInfo color_attachment = attachment_info(target_image_view, nullptr, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    VkRenderingInfo render_info = {
+        .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+        .pNext = nullptr,
+        .renderArea = VkRect2D{{0, 0}, {context.draw_extent.width, context.draw_extent.height}},
+        .layerCount = 1,
+        .colorAttachmentCount = 1,
+        .pColorAttachments = &color_attachment
+    };
+
+    vkCmdBeginRendering(cmd, &render_info);
+    ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd);
+    vkCmdEndRendering(cmd);
 }
