@@ -11,6 +11,8 @@
 #include "imgui/imgui_impl_glfw.h"
 #include "imgui/imgui_impl_vulkan.h"
 
+#include "glm/glm.hpp"
+
 const int WIN_WIDTH = 1920;
 const int WIN_HEIGHT = 1080;
 
@@ -23,6 +25,14 @@ struct AllocatedImage
     VmaAllocation allocation;
     VkExtent3D extent;
     VkFormat format;
+};
+
+struct ComputePushConstants
+{
+    glm::vec4 data1;
+    glm::vec4 data2;
+    glm::vec4 data3;
+    glm::vec4 data4;
 };
 
 struct DescriptorLayoutBuilder
@@ -193,6 +203,13 @@ int main()
 
         vkCmdBindPipeline(context.frames[current_frame % FRAME_OVERLAP].command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, context.gradient_pipeline);
         vkCmdBindDescriptorSets(context.frames[current_frame % FRAME_OVERLAP].command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, context.gradient_pipeline_layout, 0, 1, &context.draw_image_descriptors, 0, nullptr);
+        
+        ComputePushConstants pc;
+        pc.data1 = glm::vec4(1.0f, 0.0f, 0.0f, 1.0f);
+        pc.data2 = glm::vec4(0.0f, 0.0f, 1.0f, 0.0f);
+
+        vkCmdPushConstants(context.frames[current_frame % FRAME_OVERLAP].command_buffer, context.gradient_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ComputePushConstants), &pc);
+
         vkCmdDispatch(context.frames[current_frame % FRAME_OVERLAP].command_buffer, std::ceil(context.draw_extent.width / 16.0), std::ceil(context.draw_extent.height / 16.0), 1);
 
         transition_image(context.frames[current_frame % FRAME_OVERLAP].command_buffer, context.draw_image.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
@@ -729,6 +746,15 @@ void init_background_pipelines(VulkanContext& context)
     compute_layout.pSetLayouts = &context.draw_image_descriptor_layout;
     compute_layout.setLayoutCount = 1;
 
+    VkPushConstantRange push_constant = {
+        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+        .offset = 0,
+        .size = sizeof(ComputePushConstants)
+    };
+    
+    compute_layout.pPushConstantRanges = &push_constant;
+    compute_layout.pushConstantRangeCount = 1;
+
     if(vkCreatePipelineLayout(context.device, &compute_layout, nullptr, &context.gradient_pipeline_layout) != VK_SUCCESS)
     {
         std::cerr << "Failed to create pipeline layout" << std::endl;
@@ -736,7 +762,7 @@ void init_background_pipelines(VulkanContext& context)
     }
 
     VkShaderModule compute_draw_shader;
-    if(!load_shader_module("../gradient.spv", context.device, &compute_draw_shader))
+    if(!load_shader_module("../gradient_color.spv", context.device, &compute_draw_shader))
     {
         std::cerr << "Failed to create shader module" << std::endl;
         exit(-1);
