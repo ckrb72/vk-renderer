@@ -5,18 +5,50 @@
 #include <VkBootstrap.h>
 #include <vector>
 #include <span>
+#include <array>
+
+#define VMA_IMPLEMENTATION
 #include "vma.h"
 
 #include "imgui/imgui.h"
 #include "imgui/imgui_impl_glfw.h"
 #include "imgui/imgui_impl_vulkan.h"
 
-#include "glm/glm.hpp"
+#include <glm/glm.hpp>
 
 const int WIN_WIDTH = 1920;
 const int WIN_HEIGHT = 1080;
 
 constexpr uint32_t FRAME_OVERLAP = 2;
+
+struct AllocatedBuffer
+{
+    VkBuffer buffer;
+    VmaAllocation allocation;
+    VmaAllocationInfo info;
+};
+
+struct Vertex
+{
+    glm::vec3 position;
+    float uv_x;
+    glm::vec3 normal;
+    float uv_y;
+    glm::vec4 color;
+};
+
+struct GPUMeshBuffers
+{
+    AllocatedBuffer index_buffer;
+    AllocatedBuffer vertex_buffer;
+    VkDeviceAddress vertex_buffer_address;
+};
+
+struct GPUDrawPushConstants
+{
+    glm::mat4 world_matrix;
+    VkDeviceAddress vertex_buffer;
+};
 
 struct AllocatedImage
 {
@@ -143,6 +175,19 @@ struct VulkanContext
 
     ImGuiHandle imgui;
 
+    struct ImmediateSubmit
+    {
+        VkFence fence;
+        VkCommandBuffer command_buffer;
+        VkCommandPool command_pool;
+    };
+
+    ImmediateSubmit immediate_submit;
+
+    VkPipelineLayout mesh_pipeline_layout;
+    VkPipeline mesh_pipeline;
+
+    GPUMeshBuffers rectangle;
 };
 
 
@@ -166,6 +211,11 @@ void destroy_imgui(VulkanContext& context);
 void draw_imgui(VulkanContext& context, VkCommandBuffer cmd, VkImageView target_image_view);
 void init_triangle_pipeline(VulkanContext& context);
 VkRenderingAttachmentInfo attachment_info(VkImageView view, VkClearValue* clear, VkImageLayout layout);
+AllocatedBuffer create_buffer(VulkanContext& context, size_t alloc_size, VkBufferUsageFlags usage, VmaMemoryUsage memory_usage);
+void destroy_buffer(VulkanContext& context, const AllocatedBuffer& buffer);
+void immediate_submit(VulkanContext& context, std::function<void(VkCommandBuffer cmd)>&& function);
+void init_mesh_pipeline(VulkanContext& context);
+GPUMeshBuffers upload_mesh(VulkanContext& context, std::span<uint32_t> indices, std::span<Vertex> vertices);
 
 #define VK_CHECK(func) func
 
@@ -189,6 +239,28 @@ int main()
     init_descriptors(context);
     init_pipelines(context);
     init_imgui(context, window);
+
+    std::array<Vertex, 4> rect_vertices;
+	rect_vertices[0].position = {0.5,-0.5, 0};
+	rect_vertices[1].position = {0.5,0.5, 0};
+	rect_vertices[2].position = {-0.5,-0.5, 0};
+	rect_vertices[3].position = {-0.5,0.5, 0};
+
+	rect_vertices[0].color = {0,0, 0,1};
+	rect_vertices[1].color = { 0.5,0.5,0.5 ,1};
+	rect_vertices[2].color = { 1,0, 0,1 };
+	rect_vertices[3].color = { 0,1, 0,1 };
+
+    std::array<uint32_t, 6> rect_indices;
+    rect_indices[0] = 0;
+	rect_indices[1] = 1;
+	rect_indices[2] = 2;
+
+	rect_indices[3] = 2;
+	rect_indices[4] = 1;
+	rect_indices[5] = 3;
+
+    context.rectangle = upload_mesh(context, rect_indices, rect_vertices);
 
     uint32_t current_frame = 0;
     while(!glfwWindowShouldClose(window))
@@ -278,6 +350,17 @@ int main()
 
         vkCmdSetScissor(context.frames[current_frame % FRAME_OVERLAP].command_buffer, 0, 1, &scissor);
         vkCmdDraw(context.frames[current_frame % FRAME_OVERLAP].command_buffer, 3, 1, 0, 0);
+
+        vkCmdBindPipeline(context.frames[current_frame % FRAME_OVERLAP].command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, context.mesh_pipeline);
+
+        GPUDrawPushConstants push_constants;
+        push_constants.world_matrix = glm::mat4(1.0f);
+        push_constants.vertex_buffer = context.rectangle.vertex_buffer_address;
+
+        vkCmdPushConstants(context.frames[current_frame % FRAME_OVERLAP].command_buffer, context.mesh_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(GPUDrawPushConstants), &push_constants);
+        vkCmdBindIndexBuffer(context.frames[current_frame % FRAME_OVERLAP].command_buffer, context.rectangle.index_buffer.buffer, 0, VK_INDEX_TYPE_UINT32);
+        vkCmdDrawIndexed(context.frames[current_frame % FRAME_OVERLAP].command_buffer, 6, 1, 0, 0, 0);
+
         vkCmdEndRendering(context.frames[current_frame % FRAME_OVERLAP].command_buffer);
 
         transition_image(context.frames[current_frame % FRAME_OVERLAP].command_buffer, context.draw_image.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
@@ -320,6 +403,12 @@ int main()
 
     destroy_imgui(context);
 
+    destroy_buffer(context, context.rectangle.vertex_buffer);
+    destroy_buffer(context, context.rectangle.index_buffer);
+
+    vkDestroyPipelineLayout(context.device, context.mesh_pipeline_layout, nullptr);
+    vkDestroyPipeline(context.device, context.mesh_pipeline, nullptr);
+
     vkDestroyPipelineLayout(context.device, context.gradient_pipeline_layout, nullptr);
     vkDestroyPipeline(context.device, context.gradient_pipeline, nullptr);
 
@@ -337,6 +426,9 @@ int main()
         vkDestroySemaphore(context.device, context.frames[i].render_semaphore, NULL);
         vkDestroySemaphore(context.device, context.frames[i].swapchain_semaphore, NULL);
     }
+
+    vkDestroyCommandPool(context.device, context.immediate_submit.command_pool, nullptr);
+    vkDestroyFence(context.device, context.immediate_submit.fence, nullptr);
 
     vkDestroyImageView(context.device, context.draw_image.image_view, NULL);
     vmaDestroyImage(context.allocator, context.draw_image.image, context.draw_image.allocation);
@@ -509,6 +601,25 @@ void init_commands(VulkanContext& context)
 
         vkAllocateCommandBuffers(context.device, &alloc_info, &context.frames[i].command_buffer);
     }
+
+    if(vkCreateCommandPool(context.device, &command_pool_info, nullptr, &context.immediate_submit.command_pool) != VK_SUCCESS)
+    {
+        std::cerr << "Failed to create immediate submit command pool" << std::endl;
+        exit(-1);
+    }
+
+    VkCommandBufferAllocateInfo alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = context.immediate_submit.command_pool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1
+    };
+
+    if(vkAllocateCommandBuffers(context.device, &alloc_info, &context.immediate_submit.command_buffer) != VK_SUCCESS)
+    {
+        std::cerr << "Failed to create immediate command buffer" << std::endl;
+        exit(-1);
+    }
 }
 
 void init_sync_structures(VulkanContext& context)
@@ -528,6 +639,8 @@ void init_sync_structures(VulkanContext& context)
         vkCreateSemaphore(context.device, &semaphore_info, NULL, &context.frames[i].swapchain_semaphore);
         vkCreateSemaphore(context.device, &semaphore_info, NULL, &context.frames[i].render_semaphore);
     }
+
+    vkCreateFence(context.device, &fence_info, nullptr, &context.immediate_submit.fence);
 }
 
 void transition_image(VkCommandBuffer cmd, VkImage image, VkImageLayout current_layout, VkImageLayout new_layout)
@@ -807,6 +920,7 @@ void init_pipelines(VulkanContext& context)
 {
     init_background_pipelines(context);
     init_triangle_pipeline(context);
+    init_mesh_pipeline(context);
     std::cout << "All pipelines created" << std::endl;
 }
 
@@ -1152,4 +1266,163 @@ void init_triangle_pipeline(VulkanContext& context)
 
     vkDestroyShaderModule(context.device, triangle_vertex_shader, nullptr);
     vkDestroyShaderModule(context.device, triangle_frag_shader, nullptr);
+}
+
+void init_mesh_pipeline(VulkanContext& context)
+{
+    VkShaderModule mesh_vert_shader;
+    if(!load_shader_module("../colored_triangle_mesh.vert.spv", context.device, &mesh_vert_shader))
+    {
+        std::cerr << "Failed to load mesh vertex shader" << std::endl;
+        exit(-1);
+    }
+
+    VkShaderModule mesh_frag_shader;
+    if(!load_shader_module("../colored_triangle.frag.spv", context.device, &mesh_frag_shader))
+    {
+        std::cerr << "Failed to load mesh fragment shader" << std::endl;
+        exit(-1);
+    }
+
+    VkPushConstantRange buffer_range = {
+        .stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+        .offset = 0,
+        .size = sizeof(GPUDrawPushConstants)
+    };
+
+    VkPipelineLayoutCreateInfo graphics_layout = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &buffer_range
+    };
+
+    if(vkCreatePipelineLayout(context.device, &graphics_layout, nullptr, &context.mesh_pipeline_layout) != VK_SUCCESS)
+    {
+        std::cerr << "Failed to create mesh graphics pipeline" << std::endl;
+        exit(-1);
+    }
+
+    PipelineBuilder builder;
+    builder.pipeline_layout = context.mesh_pipeline_layout;
+    builder.set_shaders(mesh_vert_shader, mesh_frag_shader);
+    builder.set_input_topology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
+    builder.set_polygon_mode(VK_POLYGON_MODE_FILL);
+    builder.set_cull_mode(VK_CULL_MODE_NONE, VK_FRONT_FACE_CLOCKWISE);
+    builder.set_multisampling_none();
+    builder.disable_blending();
+    builder.disable_depthtest();
+    builder.set_color_attachment_format(context.draw_image.format);
+    builder.set_depth_format(VK_FORMAT_UNDEFINED);
+
+    context.mesh_pipeline = builder.build_pipeline(context.device);
+
+    vkDestroyShaderModule(context.device, mesh_vert_shader, nullptr);
+    vkDestroyShaderModule(context.device, mesh_frag_shader, nullptr);
+
+}
+
+AllocatedBuffer create_buffer(VulkanContext& context, size_t alloc_size, VkBufferUsageFlags usage, VmaMemoryUsage memory_usage)
+{
+    VkBufferCreateInfo buffer_info = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .pNext = nullptr,
+        .size = alloc_size,
+        .usage = usage
+    };
+
+    VmaAllocationCreateInfo vma_info = {
+        .flags = VMA_ALLOCATION_CREATE_MAPPED_BIT,
+        .usage = memory_usage
+    };
+
+    AllocatedBuffer new_buffer;
+
+    if(vmaCreateBuffer(context.allocator, &buffer_info, &vma_info, &new_buffer.buffer, &new_buffer.allocation, &new_buffer.info) != VK_SUCCESS)
+    {
+        std::cerr << "Failed to create buffer" << std::endl;
+        exit(-1);
+    }
+
+    return new_buffer;
+}
+
+void destroy_buffer(VulkanContext& context, const AllocatedBuffer& buffer)
+{
+    vmaDestroyBuffer(context.allocator, buffer.buffer, buffer.allocation);
+}
+
+GPUMeshBuffers upload_mesh(VulkanContext& context, std::span<uint32_t> indices, std::span<Vertex> vertices)
+{
+    const size_t vertex_buf_size = vertices.size() * sizeof(Vertex);
+    const size_t index_buf_size = indices.size() * sizeof(uint32_t);
+
+    GPUMeshBuffers new_surface;
+
+    new_surface.vertex_buffer = create_buffer(context, vertex_buf_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+    
+    VkBufferDeviceAddressInfo device_address_info = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+        .buffer = new_surface.vertex_buffer.buffer
+    };
+    new_surface.vertex_buffer_address = vkGetBufferDeviceAddress(context.device, &device_address_info);
+
+    new_surface.index_buffer = create_buffer(context, index_buf_size, VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+
+
+    // Create a staging buffer that send the data to the GPU buffers we just made
+    AllocatedBuffer staging_buffer = create_buffer(context, vertex_buf_size + index_buf_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_CPU_ONLY);
+    void* data = staging_buffer.allocation->GetMappedData();
+
+    memcpy(data, vertices.data(), vertex_buf_size);
+    memcpy((char*)data + vertex_buf_size, indices.data(), index_buf_size);
+
+    //TODO: IMMEDIATELY SUBMIT THE DATA TO THE GPU (HAVEN'T IMPLEMENTED THIS YET)
+    immediate_submit(context, [&](VkCommandBuffer cmd) {
+        VkBufferCopy vertex_copy = {
+            .srcOffset = 0,
+            .dstOffset = 0,
+            .size = vertex_buf_size
+        };
+        vkCmdCopyBuffer(cmd, staging_buffer.buffer, new_surface.vertex_buffer.buffer, 1, &vertex_copy);
+
+        VkBufferCopy index_copy = {
+            .srcOffset = vertex_buf_size,
+            .dstOffset = 0,
+            .size = index_buf_size
+        };
+        vkCmdCopyBuffer(cmd, staging_buffer.buffer, new_surface.index_buffer.buffer, 1, &index_copy);
+    });
+
+    destroy_buffer(context, staging_buffer);
+
+    return new_surface;
+}
+
+void immediate_submit(VulkanContext& context, std::function<void(VkCommandBuffer cmd)>&& function)
+{
+	vkResetFences(context.device, 1, &context.immediate_submit.fence);
+	vkResetCommandBuffer(context.immediate_submit.command_buffer, 0);
+
+	VkCommandBuffer cmd = context.immediate_submit.command_buffer;
+
+    VkCommandBufferBeginInfo cmd_buffer_info = {};
+    cmd_buffer_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    cmd_buffer_info.pNext = nullptr;
+    cmd_buffer_info.pInheritanceInfo = nullptr;
+    cmd_buffer_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+	vkBeginCommandBuffer(cmd, &cmd_buffer_info);
+
+	function(cmd);
+
+	vkEndCommandBuffer(cmd);
+
+	VkCommandBufferSubmitInfo cmdinfo = command_buffer_submit_info(cmd);
+	VkSubmitInfo2 submit = submit_info(&cmdinfo, nullptr, nullptr);
+
+	// submit command buffer to the queue and execute it.
+	//  _renderFence will now block until the graphic commands finish execution
+	vkQueueSubmit2(context.graphics_queue, 1, &submit, context.immediate_submit.fence);
+
+	vkWaitForFences(context.device, 1, &context.immediate_submit.fence, true, 9999999999);
 }

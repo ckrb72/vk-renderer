@@ -17,5 +17,7 @@ add_compile_options(-Wno-nullability-completeness)
 
 file(GLOB_RECURSE SRC_CXX_FILES "${SOURCE_DIR}/*.cpp")
 
+include_directories("${CMAKE_SOURCE_DIR}/vendor")
+
 add_executable(renderer ${SRC_CXX_FILES})
 target_link_libraries(renderer ${Vulkan_LIBRARIES} glfw vk-bootstrap::vk-bootstrap)
